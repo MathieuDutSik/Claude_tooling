@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Run Claude Code while mirroring the session transcript to a file of your choice.
+
+Usage:
+    claude_transcript FILE.jsonl [claude arguments...]
+
+Claude Code keeps its transcripts under ~/.claude/projects/<slug>/<session>.jsonl,
+deletes them after cleanupPeriodDays, and files them by the absolute path of the
+working directory. This wrapper starts `claude` with two extra hooks (passed via
+--settings, so the global configuration is untouched) that copy the transcript to
+FILE.jsonl after every answer (Stop) and when the session ends (SessionEnd).
+
+When the session changes (/clear, or /resume of another session), the previous
+FILE.jsonl is moved to FILE_1.jsonl, FILE_2.jsonl, ... before the new session is
+written. The session that FILE.jsonl belongs to is recorded in .FILE.jsonl.session.
+
+The same script is the hook: `claude_transcript --hook FILE.jsonl` reads the hook
+input (JSON on stdin) and does the copy. You do not call that form yourself.
+"""
+
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import sys
+import tempfile
+
+HOOK_FLAG = "--hook"
+
+
+def usage():
+    sys.stderr.write("usage: claude_transcript FILE.jsonl [claude arguments...]\n")
+    sys.exit(2)
+
+
+def marker_path(target):
+    directory, name = os.path.split(target)
+    return os.path.join(directory, "." + name + ".session")
+
+
+def next_free_rotation(target):
+    stem, suffix = os.path.splitext(target)
+    n = 1
+    while os.path.exists(f"{stem}_{n}{suffix}"):
+        n += 1
+    return f"{stem}_{n}{suffix}"
+
+
+def read_marker(marker):
+    try:
+        with open(marker) as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def copy_atomically(source, target):
+    directory = os.path.dirname(target)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp_", suffix=".jsonl")
+    try:
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            shutil.copyfileobj(src, out)
+        os.replace(tmp, target)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def run_hook(target):
+    data = json.load(sys.stdin)
+    session_id = data.get("session_id")
+    source = data.get("transcript_path")
+    if not session_id or not source or not os.path.exists(source):
+        return
+    directory = os.path.dirname(target)
+    marker = marker_path(target)
+    # Stop and SessionEnd can fire close together: serialize on the directory.
+    dir_fd = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(dir_fd, fcntl.LOCK_EX)
+        if os.path.exists(target) and read_marker(marker) != session_id:
+            os.rename(target, next_free_rotation(target))
+        copy_atomically(source, target)
+        with open(marker, "w") as f:
+            f.write(session_id + "\n")
+    finally:
+        os.close(dir_fd)
+
+
+def hook_settings(target):
+    command = " ".join(shlex.quote(x) for x in
+                       [sys.executable, os.path.realpath(__file__), HOOK_FLAG, target])
+    entry = [{"hooks": [{"type": "command", "command": command}]}]
+    return json.dumps({"hooks": {"Stop": entry, "SessionEnd": entry}})
+
+
+def launch(target, claude_args):
+    if any(a == "--settings" or a.startswith("--settings=") for a in claude_args):
+        sys.stderr.write("claude_transcript: --settings is used by the wrapper itself\n")
+        sys.exit(2)
+    if not os.path.isdir(os.path.dirname(target)):
+        sys.stderr.write(f"claude_transcript: no such directory: {os.path.dirname(target)}\n")
+        sys.exit(2)
+    claude = shutil.which("claude")
+    if claude is None:
+        sys.stderr.write("claude_transcript: claude not found in PATH\n")
+        sys.exit(2)
+    os.execv(claude, [claude, "--settings", hook_settings(target)] + claude_args)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        usage()
+    if args[0] == HOOK_FLAG:
+        if len(args) != 2:
+            usage()
+        try:
+            run_hook(args[1])
+        except Exception as e:
+            # Exit code 1 is a non-blocking hook error: it is reported but the
+            # session goes on. Never exit 2, which would stop Claude from stopping.
+            sys.stderr.write(f"claude_transcript: {e}\n")
+            sys.exit(1)
+        return
+    launch(os.path.abspath(args[0]), args[1:])
+
+
+if __name__ == "__main__":
+    main()
