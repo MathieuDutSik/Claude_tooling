@@ -12,8 +12,8 @@ const USAGE: &str = "\
 usage: process_transcripts [options] [FILE.jsonl | DIRECTORY]...
 
 Writes FILE.txt and FILE.pdf next to each FILE.jsonl. Without arguments, it
-processes every .jsonl file of the current directory. Files whose .txt and .pdf
-are newer than the .jsonl are skipped.
+processes every .jsonl file of the current directory. An output is rewritten
+only when its content changes, through a newer transcript or other options.
 
 For each prompt, only the last text block of the answer is kept: that is the
 conclusion, the earlier blocks are narration between tool calls. Tool calls,
@@ -96,24 +96,27 @@ fn jsonl_files(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn is_newer(output: &Path, input: &Path) -> bool {
-    let modified = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok();
-    match (modified(output), modified(input)) {
-        (Some(o), Some(i)) => o >= i,
-        _ => false,
+/// FNV-1a: a stable hash of the LaTeX source, to know whether the PDF is current.
+fn fnv1a(text: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
+    format!("{h:016x}")
 }
 
 fn file_name(path: &Path) -> String {
     path.file_name().unwrap_or_default().to_string_lossy().to_string()
 }
 
+/// The outputs are compared by content, not by date: a change of transcript or
+/// of options rebuilds what it changes, and nothing else. The hash of the LaTeX
+/// source of the PDF is kept in .FILE.pdf.hash.
 fn process(path: &Path, c: &Config) -> Result<String, String> {
     let txt = path.with_extension("txt");
     let pdf = path.with_extension("pdf");
-    if !c.force && is_newer(&txt, path) && (!c.pdf || is_newer(&pdf, path)) {
-        return Ok("up to date".to_string());
-    }
+    let stamp = path.with_file_name(format!(".{}.hash", file_name(&pdf)));
     let t = transcript::read(path)?;
     let source = file_name(path);
     let all = c.all_answers;
@@ -125,21 +128,38 @@ fn process(path: &Path, c: &Config) -> Result<String, String> {
         }
     };
 
-    fs::write(&txt, text::render(&t, &source, &answers, c.width, c.color)).map_err(|e| e.to_string())?;
-    let mut written = vec![file_name(&txt)];
+    let mut written = Vec::new();
+    let text = text::render(&t, &source, &answers, c.width, c.color);
+    if c.force || fs::read_to_string(&txt).ok().as_deref() != Some(text.as_str()) {
+        fs::write(&txt, text).map_err(|e| e.to_string())?;
+        written.push(file_name(&txt));
+    }
     if c.pdf {
         let tex = latex::render(&t, &source, &answers);
         let tex_path = path.with_extension("tex");
-        let result = latex::compile(&tex, &pdf);
-        if c.keep_tex || result.is_err() {
+        if c.keep_tex {
             fs::write(&tex_path, &tex).map_err(|e| e.to_string())?;
         }
-        if let Err(e) = result {
-            return Err(format!("{e}\n(the LaTeX source is in {})", tex_path.display()));
+        let hash = fnv1a(&tex);
+        let current = pdf.exists() && fs::read_to_string(&stamp).ok().as_deref() == Some(hash.as_str());
+        if c.force || !current {
+            if let Err(e) = latex::compile(&tex, &pdf) {
+                fs::write(&tex_path, &tex).map_err(|e| e.to_string())?;
+                let _ = fs::remove_file(&stamp);
+                return Err(format!("{e}\n(the LaTeX source is in {})", tex_path.display()));
+            }
+            fs::write(&stamp, &hash).map_err(|e| e.to_string())?;
+            written.push(file_name(&pdf));
         }
-        written.push(file_name(&pdf));
     }
-    Ok(format!("{} prompts → {}", t.turns.len(), written.join(", ")))
+    let prompts = match t.turns.len() {
+        1 => "1 prompt".to_string(),
+        n => format!("{n} prompts"),
+    };
+    if written.is_empty() {
+        return Ok(format!("{prompts}, up to date"));
+    }
+    Ok(format!("{prompts} → {}", written.join(", ")))
 }
 
 fn main() -> ExitCode {
