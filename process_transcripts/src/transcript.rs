@@ -53,9 +53,14 @@ impl Cleaner {
     }
 
     /// The text of a user prompt, or None when the event is not a typed prompt.
+    /// Messages injected by Claude Code, such as the notification that a
+    /// background task finished, have promptSource "system": what Claude
+    /// answers to them stays with the prompt before.
     fn prompt_text(&self, v: &Value) -> Option<String> {
         if v.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
             || v.get("isCompactSummary").and_then(Value::as_bool).unwrap_or(false)
+            || str_field(v, "promptSource") == Some("system")
+            || v.get("origin").and_then(|o| str_field(o, "kind")) == Some("task-notification")
         {
             return None;
         }
@@ -86,6 +91,7 @@ impl Cleaner {
         if text.is_empty()
             || text.starts_with("<command-")
             || text.starts_with("<local-command-")
+            || text.starts_with("<task-notification>")
             || text.starts_with("[Request interrupted by user")
         {
             return None;
@@ -96,27 +102,37 @@ impl Cleaner {
 
 /// The events of the live conversation, oldest first.
 fn main_chain(events: &[Value]) -> Vec<&Value> {
-    let mut by_uuid: HashMap<&str, &Value> = HashMap::new();
-    for e in events {
+    let mut by_uuid: HashMap<&str, usize> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
         if let Some(u) = str_field(e, "uuid") {
-            by_uuid.insert(u, e);
+            by_uuid.insert(u, i);
         }
     }
-    let Some(leaf) = events.iter().rev().find(|e| is_message(e)) else {
+    let Some(leaf) = events.iter().rposition(is_message) else {
         return Vec::new();
     };
     let mut chain = Vec::new();
     let mut seen = HashSet::new();
     let mut current = Some(leaf);
-    while let Some(e) = current {
+    while let Some(i) = current {
+        let e = &events[i];
         let uuid = str_field(e, "uuid").unwrap_or("");
         if !seen.insert(uuid) {
             break;
         }
         chain.push(e);
-        // A compaction restarts the chain; logicalParentUuid links it to what came before.
-        let parent = str_field(e, "parentUuid").or_else(|| str_field(e, "logicalParentUuid"));
-        current = parent.and_then(|p| by_uuid.get(p).copied());
+        current = match str_field(e, "parentUuid") {
+            Some(p) => by_uuid.get(p).copied(),
+            // A compaction restarts the chain; logicalParentUuid links it to what
+            // came before. It can name an attachment that was re-parented under the
+            // compact summary, which would loop: then the last message written
+            // before the boundary is what came before.
+            None => match str_field(e, "logicalParentUuid").and_then(|p| by_uuid.get(p)) {
+                Some(&p) if !seen.contains(str_field(&events[p], "uuid").unwrap_or("")) => Some(p),
+                Some(_) => events[..i].iter().rposition(is_message),
+                None => None,
+            },
+        };
     }
     chain.reverse();
     chain
